@@ -1,0 +1,36 @@
+name: Run Python Script
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Run python script
+        run: |
+          python resolve_domain.py
+
+      - name: Upload file as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-output
+          path: resolve_result.txt
