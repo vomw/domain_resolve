@@ -50,9 +50,10 @@ jobs:
           pattern: partial-results-*
           merge-multiple: true
 
-      - name: Merge results
+      - name: Merge and Sort results
         run: |
-          cat artifacts/resolve_result_*.txt > resolve_result.txt
+          # Use sort to combine all partial files into one alphabetically sorted final result
+          sort artifacts/resolve_result_*.txt > resolve_result.txt
 
       - name: Upload final artifact
         uses: actions/upload-artifact@v4

@@ -10,33 +10,21 @@ import dns.exception
 
 # Configuration
 DNS_SERVER_LIST = [
-    "138.199.149.249:53",
     "149.112.112.10:53",
     "149.112.112.11:53",
     "149.112.112.112:53",
     "149.112.112.12:53",
     "149.112.112.9:53",
-    "176.9.1.117:53",
-    "176.9.93.198:53",
-    "185.228.168.9:53",
-    "185.228.169.9:53",
     "208.67.220.220:443",
     "208.67.220.222:443",
     "208.67.222.220:443",
     "208.67.222.222:443",
-    "49.12.222.213:53",
-    "49.12.223.2:53",
-    "49.12.43.208:53",
-    "49.12.67.122:53",
-    "78.47.71.194:53",
     "8.8.4.4:53",
     "8.8.8.8:53",
-    "88.198.122.154:53",
     "9.9.9.10:53",
     "9.9.9.11:53",
     "9.9.9.12:53",
     "9.9.9.9:53",
-    "91.99.154.175:53",
 ]
 
 DNS_TIMEOUT = 2.0
@@ -71,15 +59,20 @@ async def resolve_query_with_retry(domain, qtype):
 
 async def worker(domain, semaphore):
     """Async worker for a single domain. Returns result string only if resolution succeeds."""
-    async with semaphore:
-        res_a = await resolve_query_with_retry(domain, "A")
-        res_aaaa = await resolve_query_with_retry(domain, "AAAA")
+    try:
+        async with semaphore:
+            res_a = await resolve_query_with_retry(domain, "A")
+            res_aaaa = await resolve_query_with_retry(domain, "AAAA")
 
-        all_res = res_a + res_aaaa
-        if not all_res:
-            return None
+            all_res = res_a + res_aaaa
+            if not all_res:
+                return None
 
-        return f"{domain} {" ".join(all_res)}"
+            return f"{domain} {" ".join(all_res)}"
+    except Exception as e:
+        # Prevent a single bad domain from crashing the whole script
+        print(f"\nError processing {domain}: {e}", file=sys.stderr)
+        return None
 
 
 def get_sharded_list(full_list, shard_index, total_shards):
@@ -91,6 +84,7 @@ def get_sharded_list(full_list, shard_index, total_shards):
     chunk_size = total_items // total_shards
     remainder = total_items % total_shards
 
+    # Correctly distribute the remainder items among the first shards
     start = shard_index * chunk_size + min(shard_index, remainder)
     end = start + chunk_size + (1 if shard_index < remainder else 0)
 
@@ -108,6 +102,7 @@ async def main_async(domain_list):
     results = []
 
     completed = 0
+    # Process as completed to show real-time progress
     for future in asyncio.as_completed(tasks):
         res = await future
         completed += 1
@@ -117,20 +112,17 @@ async def main_async(domain_list):
 
         if completed % 100 == 0 or completed == total:
             percent = (completed / total) * 100
-            current_domain = res.split()[0] if res else "..."
-            print(
-                f"[{percent:6.2f}%] {completed}/{total} - {current_domain}", flush=True
-            )
+            # For the progress bar, if res is None we just print dots
+            domain_name = res.split()[0] if res else "..."
+            print(f"[{percent:6.2f}%] {completed}/{total} - {domain_name}", flush=True)
 
     end_time = time.time()
     print(f"Finished in {end_time - start_time:.2f} seconds.", flush=True)
     print(f"Successfully resolved {len(results)}/{total} domains.")
 
-    # Sort results alphabetically
-    print("Sorting results...")
+    # Local sort (optional but good for consistency)
     results.sort()
 
-    # Write results
     with open("resolve_result.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(results) + "\n")
 
@@ -161,12 +153,10 @@ def main():
         print("No domains found in all_domain.txt")
         return
 
-    # 1. Randomly shuffle the domain list before processing
-    # Using a fixed seed ensures consistent sharding across multiple runners
+    # Shuffle with fixed seed for consistent sharding across runners
     random.seed(42)
     random.shuffle(domain_list)
 
-    # Apply sharding
     my_domains = get_sharded_list(domain_list, args.shard_index, args.total_shards)
     print(
         f"Shard {args.shard_index + 1}/{args.total_shards}: Processing {len(my_domains)} domains"
