@@ -65,18 +65,20 @@ async def resolve_query_with_retry(domain, qtype):
         except (dns.resolver.Timeout, dns.exception.DNSException):
             continue
         except Exception:
-            # Catch-all for other potential asyncresolver issues
             continue
     return []
 
 
 async def worker(domain, semaphore):
-    """Async worker for a single domain."""
+    """Async worker for a single domain. Returns result string only if resolution succeeds."""
     async with semaphore:
         res_a = await resolve_query_with_retry(domain, "A")
         res_aaaa = await resolve_query_with_retry(domain, "AAAA")
 
         all_res = res_a + res_aaaa
+        if not all_res:
+            return None
+
         return f"{domain} {" ".join(all_res)}"
 
 
@@ -105,23 +107,30 @@ async def main_async(domain_list):
     start_time = time.time()
     results = []
 
-    # Use as_completed to process results as they come in for progress tracking
     completed = 0
     for future in asyncio.as_completed(tasks):
         res = await future
-        results.append(res)
         completed += 1
+
+        if res:
+            results.append(res)
 
         if completed % 100 == 0 or completed == total:
             percent = (completed / total) * 100
+            current_domain = res.split()[0] if res else "..."
             print(
-                f"[{percent:6.2f}%] {completed}/{total} - {res.split()[0]}", flush=True
+                f"[{percent:6.2f}%] {completed}/{total} - {current_domain}", flush=True
             )
 
     end_time = time.time()
     print(f"Finished in {end_time - start_time:.2f} seconds.", flush=True)
+    print(f"Successfully resolved {len(results)}/{total} domains.")
 
-    # Write results (bulk write is faster than line-by-line)
+    # Sort results alphabetically
+    print("Sorting results...")
+    results.sort()
+
+    # Write results
     with open("resolve_result.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(results) + "\n")
 
@@ -130,7 +139,6 @@ def read_domain_list_from_file():
     if not os.path.exists("all_domain.txt"):
         return []
     with open("all_domain.txt", "r", encoding="utf-8") as f:
-        # Filter out empty lines or lines with spaces
         return [line.strip() for line in f if line.strip() and " " not in line.strip()]
 
 
@@ -153,17 +161,21 @@ def main():
         print("No domains found in all_domain.txt")
         return
 
+    # 1. Randomly shuffle the domain list before processing
+    # Using a fixed seed ensures consistent sharding across multiple runners
+    random.seed(42)
+    random.shuffle(domain_list)
+
     # Apply sharding
     my_domains = get_sharded_list(domain_list, args.shard_index, args.total_shards)
     print(
-        f"Shard {args.shard_index + 1}/{args.total_shards}: Processing {len(my_domains)} domains out of {len(domain_list)}"
+        f"Shard {args.shard_index + 1}/{args.total_shards}: Processing {len(my_domains)} domains"
     )
 
     if not my_domains:
         print("No domains in this shard.")
         return
 
-    # Run async loop
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
