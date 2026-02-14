@@ -1,199 +1,166 @@
 import argparse
 import asyncio
-import dns.asyncquery
 import dns.message
 import dns.rcode
+import dns.rdatatype
 import httpx
 import os
 import random
 import sys
 import time
 
-# DoH Server Pool for Load Balancing and MITM protection
+# Optimized DoH Server Pool
 DOH_SERVER_LIST = [
-    "https://1.0.0.1/dns-query",
-    "https://1.0.0.2/dns-query",
-    "https://1.0.0.3/dns-query",
-    "https://1.1.1.1/dns-query",
-    "https://1.1.1.2/dns-query",
-    "https://1.1.1.3/dns-query",
-    "https://146.112.41.2/dns-query",
-    "https://146.112.41.3/dns-query",
-    "https://146.112.41.4/dns-query",
-    "https://146.112.41.5/dns-query",
-    "https://149.112.112.10/dns-query",
-    "https://149.112.112.11/dns-query",
-    "https://149.112.112.112/dns-query",
-    "https://149.112.112.12/dns-query",
-    "https://149.112.112.13/dns-query",
-    "https://149.112.112.9/dns-query",
-    "https://204.194.232.200/dns-query",
-    "https://208.67.220.123/dns-query",
-    "https://208.67.220.2/dns-query",
-    "https://208.67.220.220/dns-query",
-    "https://208.67.222.123/dns-query",
-    "https://208.67.222.2/dns-query",
-    "https://208.67.222.222/dns-query",
-    "https://8.8.4.4/dns-query",
-    "https://8.8.8.8/dns-query",
-    "https://9.9.9.10/dns-query",
-    "https://9.9.9.11/dns-query",
-    "https://9.9.9.12/dns-query",
-    "https://9.9.9.13/dns-query",
-    "https://9.9.9.9/dns-query",
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.adguard-dns.com/dns-query",
+    "https://dns.controld.com/com-default",
+    "https://dns.google/dns-query",
+    "https://dns.quad9.net/dns-query",
+    "https://doh.cleanbrowsing.org/doh/family-filter/",
+    "https://doh.dns.sb/dns-query",
+    "https://doh.gcore.com/dns-query" "https://doh.libredns.gr/dns-query",
+    "https://doh.mullvad.net/dns-query",
+    "https://doh.opendns.com/dns-query",
+    "https://doh.powerdns.org",
 ]
 
-DNS_TIMEOUT = 5.0  # Increased for DoH overhead
+# Tuning for GitHub Actions (2-core runners)
+CONCURRENCY = 300
+DNS_TIMEOUT = 5.0
 RETRIES = 2
-CONCURRENCY = 150  # Slightly lower for DoH to be more polite/stable
 
 
-async def resolve_query_with_retry(domain, qtype, session):
-    """Perform a DNS-over-HTTPS query with retries across different providers."""
-    # Use a copy to avoid modifying the global list
-    servers = DOH_SERVER_LIST.copy()
-    random.shuffle(servers)
+async def resolve_query(domain, qtype, session):
+    """Attempt resolution across the server pool with retries."""
+    q = dns.message.make_query(domain, qtype)
+    query_data = q.to_wire()
+    headers = {
+        "Content-Type": "application/dns-message",
+        "Accept": "application/dns-message",
+        "User-Agent": "GitHubAction-DNS-Resolver/1.0",
+    }
 
-    for i in range(min(RETRIES + 1, len(servers))):
-        url = servers[i]
-        q = dns.message.make_query(domain, qtype)
+    # Shuffle servers for this specific domain request to spread load
+    servers = random.sample(DOH_SERVER_LIST, min(len(DOH_SERVER_LIST), RETRIES + 1))
+
+    for url in servers:
         try:
-            # Authenticated and Encrypted DNS Query
-            response = await dns.asyncquery.https(
-                q, url, timeout=DNS_TIMEOUT, session=session
+            resp = await session.post(
+                url, content=query_data, headers=headers, timeout=DNS_TIMEOUT
             )
-
-            if response.rcode() == dns.rcode.NOERROR:
-                results = []
-                for answer in response.answer:
-                    # Filter for correct type (A or AAAA)
-                    if answer.rdtype == (
-                        dns.rdatatype.A if qtype == "A" else dns.rdatatype.AAAA
-                    ):
-                        results.extend([r.to_text() for r in answer])
-                return results
-            elif response.rcode() == dns.rcode.NXDOMAIN:
-                return []  # Domain definitely doesn't exist
+            if resp.status_code == 200:
+                msg = dns.message.from_wire(resp.content)
+                if msg.rcode() == dns.rcode.NOERROR:
+                    return [
+                        r.to_text()
+                        for section in msg.answer
+                        if section.rdtype
+                        == (dns.rdatatype.A if qtype == "A" else dns.rdatatype.AAAA)
+                        for r in section
+                    ]
+                elif msg.rcode() == dns.rcode.NXDOMAIN:
+                    return []
         except Exception:
-            # On error (timeout, rate limit, etc), retry with next server
             continue
     return []
 
 
 async def worker(domain, semaphore, session):
-    """Async worker for a single domain using DoH."""
-    try:
-        async with semaphore:
-            # Resolve A and AAAA in parallel for this domain
+    """Processes a single domain."""
+    async with semaphore:
+        try:
+            # Resolve A and AAAA concurrently
             res_a, res_aaaa = await asyncio.gather(
-                resolve_query_with_retry(domain, "A", session),
-                resolve_query_with_retry(domain, "AAAA", session),
+                resolve_query(domain, "A", session),
+                resolve_query(domain, "AAAA", session),
             )
-
             all_res = res_a + res_aaaa
-            if not all_res:
-                return None
-
-            return f"{domain} {' '.join(all_res)}"
-    except Exception as e:
-        print(f"\nError processing {domain}: {e}", file=sys.stderr)
-        return None
-
-
-def get_sharded_list(full_list, shard_index, total_shards):
-    """Split the list into shards."""
-    if total_shards <= 1:
-        return full_list
-    total_items = len(full_list)
-    chunk_size = total_items // total_shards
-    remainder = total_items % total_shards
-    start = shard_index * chunk_size + min(shard_index, remainder)
-    end = start + chunk_size + (1 if shard_index < remainder else 0)
-    return full_list[start:end]
+            return f"{domain} {' '.join(all_res)}" if all_res else None
+        except Exception:
+            return None
 
 
 async def main_async(domain_list):
-    # Use a single httpx client for connection pooling across all requests
-    async with httpx.AsyncClient(http2=True, verify=True) as session:
+    # Performance-tuned HTTP client
+    limits = httpx.Limits(max_keepalive_connections=100, max_connections=CONCURRENCY)
+    async with httpx.AsyncClient(http2=True, limits=limits, trust_env=False) as session:
         semaphore = asyncio.Semaphore(CONCURRENCY)
 
-        # Create tasks
-        tasks = [worker(domain, semaphore, session) for domain in domain_list]
-
+        # Batch processing to manage memory for very large lists
         total = len(domain_list)
-        print(f"Starting async DoH resolution of {total} domains...", flush=True)
-        print(f"Using {len(DOH_SERVER_LIST)} providers for load balancing.")
+        print(f"Starting resolution of {total} domains (Concurrency: {CONCURRENCY})")
 
         start_time = time.time()
         results = []
-        completed = 0
+        tasks = [worker(d, semaphore, session) for d in domain_list]
 
+        completed = 0
         for future in asyncio.as_completed(tasks):
             res = await future
             completed += 1
-
             if res:
                 results.append(res)
 
-            if completed % 50 == 0 or completed == total:
-                percent = (completed / total) * 100
-                domain_name = res.split()[0] if res else "..."
+            # Progress reporting optimized for GitHub Action logs
+            if completed % 500 == 0 or completed == total:
+                elapsed = time.time() - start_time
+                rate = completed / elapsed if elapsed > 0 else 0
                 print(
-                    f"[{percent:6.2f}%] {completed}/{total} - {domain_name}", flush=True
+                    f"[{completed/total:>7.2%}] {completed}/{total} | Resolved: {len(results)} | Rate: {rate:.1f} dom/s",
+                    flush=True,
                 )
 
         end_time = time.time()
-        print(f"Finished in {end_time - start_time:.2f} seconds.", flush=True)
-        print(f"Successfully resolved {len(results)}/{total} domains.")
+        print(f"\nFinal Statistics:")
+        print(f"  Total Domains:    {total}")
+        print(f"  Successfully Resolved: {len(results)}")
+        print(f"  Success Rate:     {len(results)/total:>7.2%}")
+        print(f"  Total Duration:   {end_time - start_time:.2f}s")
 
-        print("Sorting results...")
+        # Final Sort and Write
         results.sort()
-
         with open("resolve_result.txt", "w", encoding="utf-8") as f:
             f.write("\n".join(results) + "\n")
 
 
-def read_domain_list_from_file():
-    if not os.path.exists("all_domain.txt"):
-        return []
-    with open("all_domain.txt", "r", encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip() and " " not in line.strip()]
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Async DoH Resolver")
-    parser.add_argument(
-        "--shard-index", type=int, default=0, help="Index of the current shard"
-    )
-    parser.add_argument(
-        "--total-shards", type=int, default=1, help="Total number of shards"
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--total-shards", type=int, default=1)
     args = parser.parse_args()
 
-    domain_list = read_domain_list_from_file()
-    if not domain_list:
-        print("No domains found in all_domain.txt")
+    if not os.path.exists("all_domain.txt"):
+        print("Error: all_domain.txt not found.")
         return
 
-    # Shuffle with fixed seed
+    with open("all_domain.txt", "r", encoding="utf-8") as f:
+        full_list = [
+            line.strip() for line in f if line.strip() and " " not in line.strip()
+        ]
+
+    # Shuffle for consistent distribution across shards
     random.seed(42)
-    random.shuffle(domain_list)
+    random.shuffle(full_list)
 
-    my_domains = get_sharded_list(domain_list, args.shard_index, args.total_shards)
-    print(
-        f"Shard {args.shard_index + 1}/{args.total_shards}: Processing {len(my_domains)} domains"
+    # Sharding Logic
+    n = len(full_list)
+    start = args.shard_index * (n // args.total_shards) + min(
+        args.shard_index, n % args.total_shards
     )
+    end = (args.shard_index + 1) * (n // args.total_shards) + min(
+        args.shard_index + 1, n % args.total_shards
+    )
+    my_domains = full_list[start:end]
 
-    if not my_domains:
-        return
+    print(
+        f"Running Shard {args.shard_index + 1}/{args.total_shards} ({len(my_domains)} domains)"
+    )
 
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    try:
+    if my_domains:
         asyncio.run(main_async(my_domains))
-    except KeyboardInterrupt:
-        print("Interrupted.")
 
 
 if __name__ == "__main__":
