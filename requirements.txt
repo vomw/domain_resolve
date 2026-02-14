@@ -1,2 +1,2 @@
 dnspython[https]
-httpx
+httpx[http2]
